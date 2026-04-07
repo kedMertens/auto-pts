@@ -21,7 +21,7 @@ from time import sleep
 from autopts.ptsprojects.stack import get_stack
 from autopts.ptsprojects.testcase import MMI
 from autopts.pybtp import btp
-from autopts.pybtp.types import GATTErrorCodes, IOCap, WIDParams
+from autopts.pybtp.types import BTPError, GATTErrorCodes, IOCap, WIDParams
 from autopts.wid import generic_wid_hdl
 
 log = logging.debug
@@ -50,26 +50,33 @@ def hdl_wid_1(_: WIDParams):
     return True
 
 
-def hdl_wid_2(_: WIDParams):
+def hdl_wid_2(params: WIDParams):
     """
     Please initiate a GATT connection to the PTS.
 
     Description: Verify that the Implementation Under Test (IUT) can
     initiate GATT connect request to PTS.
     """
-    btp.gap_conn()
+    if "LT2" in params.test_case_name:
+        btp.gap_conn(btp.lt2_addr_get(), btp.lt2_addr_type_get())
+    else:
+        btp.gap_conn(btp.pts_addr_get(), btp.pts_addr_type_get())
     return True
 
 
-def hdl_wid_3(_: WIDParams):
+def hdl_wid_3(params: WIDParams):
     """
     Please initiate a GATT disconnection to the PTS.
 
     Description: Verify that the Implementation Under Test (IUT) can
     initiate GATT disconnect request to PTS.
     """
-    btp.gap_disconn(btp.pts_addr_get(), btp.pts_addr_type_get())
-    return get_stack().gap.wait_for_disconnection(30)
+    if "LT2" in params.test_case_name:
+        btp.gap_disconn(btp.lt2_addr_get(), btp.lt2_addr_type_get())
+        return get_stack().gap.wait_for_disconnection(30, btp.lt2_addr_get())
+    else:
+        btp.gap_disconn(btp.pts_addr_get(), btp.pts_addr_type_get())
+        return get_stack().gap.wait_for_disconnection(30)
 
 
 def hdl_wid_4(_: WIDParams):
@@ -1329,9 +1336,119 @@ def hdl_wid_147(params: WIDParams):
     hdl1 = MMI.args[0]
     hdl2 = MMI.args[1]
 
-    btp.gatt_cl_read_multiple_var(btp.pts_addr_type_get(), btp.pts_addr_get(), hdl1, hdl2)
-    btp.gatt_cl_read_multiple_var(btp.pts_addr_type_get(), btp.pts_addr_get(), hdl1, hdl2)
+    if not hdl1 or not hdl2:
+        logging.error("parsing error")
+        return False
+
+    stack = get_stack()
+
+    btp.clear_verify_values()
+
+    try:
+        btp.gatt_cl_read_multiple_var(
+            btp.pts_addr_type_get(),
+            btp.pts_addr_get(),
+            hdl1,
+            hdl2,
+        )
+        btp.gatt_cl_read_multiple_var(
+            btp.pts_addr_type_get(),
+            btp.pts_addr_get(),
+            hdl1,
+            hdl2,
+        )
+    except Exception as err:
+        logging.error("%s read_multiple_var command failed: %r", hdl_wid_147.__name__, err)
+        return False
+
+    if not stack.gatt_cl.wait_for_verify_values(timeout=35, expected_count=2):
+        logging.error("%s timeout waiting for two read_multiple_var async events", hdl_wid_147.__name__)
+        return False
+
+    verify_values = btp.get_verify_values()
+    if len(verify_values) < 2:
+        logging.error("%s missing read_multiple_var verify values: %r", hdl_wid_147.__name__, verify_values)
+        return False
+
+    for item in verify_values[:2]:
+        status = item[0] if isinstance(item, tuple) else item
+        if status != "":
+            logging.error("%s read_multiple_var failed, ATT status: %r", hdl_wid_147.__name__, status)
+            return False
+
     return True
+
+
+def hdl_wid_148(params: WIDParams):
+    """
+    Please send two Read Multiple Variable Length characteristic requests using these handles: 'XXXX'O 'XXXX'O
+    Required Bearers are "EATT" bearers.
+
+    Description: Verify that the Implementation Under Test (IUT) can receive multiple characteristics.
+    """
+    MMI.reset()
+    MMI.parse_description(params.description)
+
+    hdl1 = MMI.args[0]
+    hdl2 = MMI.args[1]
+
+    if not hdl1 or not hdl2:
+        logging.error("parsing error")
+        return False
+
+    stack = get_stack()
+    for attempt in range(2):
+        btp.clear_verify_values()
+
+        try:
+            btp.gatt_cl_read_multiple_var(
+                btp.pts_addr_type_get(),
+                btp.pts_addr_get(),
+                hdl1,
+                hdl2,
+            )
+            btp.gatt_cl_read_multiple_var(
+                btp.pts_addr_type_get(),
+                btp.pts_addr_get(),
+                hdl1,
+                hdl2,
+            )
+        except Exception as err:
+            logging.error("%s read_multiple_var command failed: %r", hdl_wid_148.__name__, err)
+            return False
+
+        if not stack.gatt_cl.wait_for_verify_values(timeout=35, expected_count=2):
+            logging.error("%s timeout waiting for two read_multiple_var async events", hdl_wid_148.__name__)
+            return False
+
+        verify_values = btp.get_verify_values()
+        if len(verify_values) < 2:
+            logging.error("%s missing read_multiple_var verify values: %r", hdl_wid_148.__name__, verify_values)
+            return False
+
+        statuses = [item[0] if isinstance(item, tuple) else item for item in verify_values[:2]]
+
+        if all(status == "" for status in statuses):
+            return True
+
+        if attempt == 0 and all(status == "unlikely error" for status in statuses):
+            logging.debug("%s got ATT 0x0e on first read_multiple_var attempt, retrying once", hdl_wid_148.__name__)
+            logging.debug(
+                "%s waiting for link ready before second read_multiple_var attempt",
+                hdl_wid_148.__name__,
+            )
+            if not stack.gap.wait_for_connection(timeout=10, addr=btp.pts_addr_get()):
+                logging.error(
+                    "%s retry aborted: no connection to PTS before second attempt after ATT 0x0e",
+                    hdl_wid_148.__name__,
+                )
+                return False
+            continue
+
+        logging.error("%s read_multiple_var failed, ATT statuses: %r", hdl_wid_148.__name__, statuses)
+        return False
+
+    return False
 
 
 def hdl_wid_150(params: WIDParams):
@@ -1346,6 +1463,101 @@ def hdl_wid_150(params: WIDParams):
         btp.gap_pair()
 
     return True
+
+
+def hdl_wid_400(params: WIDParams):
+    """
+    Please prepare IUT into an L2CAP Credit Based Connection connectable
+    mode using LE signaling channel.
+
+    Description: Verify that the Implementation Under Test (IUT)
+    can accept L2CAP_CREDIT_BASED_CONNECTION_REQ from PTS.
+    """
+
+    def _try_eatt_connect(num):
+        try:
+            btp.gatt_cl_eatt_connect(
+                btp.pts_addr_get(),
+                btp.pts_addr_type_get(),
+                num,
+            )
+            return None
+        except Exception as err:
+            return err
+
+    def _try_eatt_disconnect(num):
+        try:
+            btp.l2cap_disconn_eatt_chans(
+                btp.pts_addr_get(),
+                btp.pts_addr_type_get(),
+                num,
+            )
+            return None
+        except Exception as err:
+            return err
+
+    if params.test_case_name.startswith("GATT/CL/GAR/"):
+        gap_ev = get_stack().gap.gap_wait_for_sec_lvl_change(
+            level=2,
+            timeout=10,
+            addr=btp.pts_addr_get(),
+        )
+        if gap_ev is None:
+            return True
+
+        sleep(1.0)
+
+        eatt_bearers = {
+            "GATT/CL/GAR/BV-10-C": 1,
+            "GATT/CL/GAR/BV-11-C": 2,
+        }
+        eatt_num = eatt_bearers.get(params.test_case_name)
+        if eatt_num is not None:
+            for _attempt in range(1, 4):
+                err = _try_eatt_connect(eatt_num)
+                if err is None:
+                    return True
+                if isinstance(err, BTPError):
+                    disconn_err = _try_eatt_disconnect(eatt_num)
+                    if disconn_err is not None:
+                        logging.debug(
+                            "%s EATT disconnect cleanup failed for %s: %r",
+                            hdl_wid_400.__name__,
+                            params.test_case_name,
+                            disconn_err,
+                        )
+                        break
+                    sleep(0.5)
+                    continue
+                sleep(0.5)
+
+            logging.error(
+                "%s could not setup EATT bearers for %s",
+                hdl_wid_400.__name__,
+                params.test_case_name,
+            )
+            return False
+        return True
+
+    for _attempt in range(1, 4):
+        err = _try_eatt_connect(1)
+        if err is None:
+            return True
+        if isinstance(err, BTPError):
+            disconn_err = _try_eatt_disconnect(1)
+            if disconn_err is not None:
+                logging.debug(
+                    "%s EATT disconnect cleanup failed: %r",
+                    hdl_wid_400.__name__,
+                    disconn_err,
+                )
+                break
+            sleep(0.5)
+            continue
+        sleep(0.5)
+
+    logging.error("%s could not setup EATT bearer", hdl_wid_400.__name__)
+    return False
 
 
 def hdl_wid_502(_: WIDParams):

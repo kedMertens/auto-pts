@@ -29,8 +29,8 @@ from autopts.pybtp.btp.btp import (
 )
 from autopts.pybtp.btp.btp import get_iut_method as get_iut
 from autopts.pybtp.btp.gap import gap_wait_for_connection
-from autopts.pybtp.common import gatt_cl
-from autopts.pybtp.types import Perm, addr_str_to_le_bytes, le_bytes_to_hex_str, le_bytes_to_uuid, uuid_to_le_bytes
+from autopts.pybtp.common import CONTROLLER_INDEX, gatt_cl
+from autopts.pybtp.types import BTPError, Perm, addr_str_to_le_bytes, le_bytes_to_hex_str, le_bytes_to_uuid, uuid_to_le_bytes
 
 GATTC = gatt_cl
 
@@ -39,6 +39,11 @@ def gatt_cl_mtu_exchanged_ev_(gatt_cl, data, data_len):
     logging.debug("%s %r", gatt_cl_mtu_exchanged_ev_.__name__, data)
 
     fmt = '<B6sB'
+    read_mult_var_fmt = '<B6sBBH'
+
+    if data_len >= struct.calcsize(read_mult_var_fmt):
+        gatt_cl_read_mult_var_rsp_ev_(gatt_cl, data, data_len)
+        return
 
     addr_type, addr, status = struct.unpack_from(fmt, data)
     addr = le_bytes_to_hex_str(addr)
@@ -429,8 +434,8 @@ def gatt_cl_read_uuid_rsp_ev_(gatt_cl, data, data_len):
                   gatt_cl_read_uuid_rsp_ev_.__name__,
                   addr_type, addr, status, data_length, value_length)
 
-    if status != 0:
-        add_to_verify_values(att_rsp_str[status])
+    if status != 0 and data_length == 0:
+        add_to_verify_values(att_rsp_str.get(status, f"ATT error 0x{status:02x}"))
         return
 
     data_fmt = f">H{value_length}s"
@@ -534,33 +539,78 @@ def gatt_cl_read_mult_rsp_ev_(gatt_cl, data, data_len):
 def gatt_cl_read_mult_var_rsp_ev_(gatt_cl, data, data_len):
     logging.debug("%s %r", gatt_cl_read_mult_var_rsp_ev_.__name__, data)
 
-    fmt = '<B6sBH'
+    # Legacy format: <addr_type, addr, att_status, data_length>
+    legacy_fmt = '<B6sBH'
+    # Migrated Zephyr format: <addr_type, addr, btp_status, att_status, data_length>
+    migrated_fmt = '<B6sBBH'
 
-    addr_type, addr, status, data_length = \
-        struct.unpack_from(fmt, data[:struct.calcsize(fmt)])
-    logging.debug("%s received addr_type=%r addr=%r status=%r data_len=%r",
+    legacy_size = struct.calcsize(legacy_fmt)
+    migrated_size = struct.calcsize(migrated_fmt)
+    known_btp_statuses = {
+        defs.BTP_STATUS_SUCCESS,
+        defs.BTP_STATUS_FAILED,
+        defs.BTP_STATUS_UNKNOWN_CMD,
+        defs.BTP_STATUS_NOT_READY,
+    }
+
+    use_migrated = False
+    if data_len >= migrated_size:
+        _, _, cand_status, _, cand_data_length = struct.unpack_from(
+            migrated_fmt, data[:migrated_size]
+        )
+        cand_payload_len = data_len - migrated_size
+        if cand_status in known_btp_statuses and cand_payload_len >= cand_data_length:
+            use_migrated = True
+
+    if use_migrated:
+        addr_type, addr, status, att_status, data_length = struct.unpack_from(
+            migrated_fmt, data[:migrated_size]
+        )
+        rp_data = data[migrated_size:]
+    elif data_len >= legacy_size:
+        addr_type, addr, att_status, data_length = struct.unpack_from(
+            legacy_fmt, data[:legacy_size]
+        )
+        status = 0
+        rp_data = data[legacy_size:]
+    else:
+        add_to_verify_values("Malformed READ_MULTIPLE_VAR response")
+        logging.debug("Set verify values to: %r", get_verify_values())
+        return
+
+    logging.debug(
+        "%s received addr_type=%r addr=%r status=%r att_status=%r data_len=%r",
                   gatt_cl_read_mult_var_rsp_ev_.__name__,
-                  addr_type, addr, status, data_length)
+                  addr_type, addr, status, att_status, data_length)
 
-    rp_data = data[struct.calcsize(fmt):]
+    if status != 0:
+        add_to_verify_values(f"BTP status 0x{status:02x}")
+        logging.debug("Set verify values to: %r", get_verify_values())
+        return
 
     if data_length == 0:
         logging.debug("No data in response")
-        add_to_verify_values(att_rsp_str[status])
+        status_str = att_rsp_str.get(att_status, f"ATT error 0x{att_status:02x}")
+        add_to_verify_values(status_str)
+        logging.debug("Set verify values to: %r", get_verify_values())
+        return
+
+    if len(rp_data) < data_length:
+        add_to_verify_values("Malformed READ_MULTIPLE_VAR response")
         logging.debug("Set verify values to: %r", get_verify_values())
         return
 
     (value,) = struct.unpack_from(f"{data_length}s", rp_data)
 
-    logging.debug("%s %r %r", gatt_cl_read_mult_rsp_ev_.__name__, status, value)
+    logging.debug("%s %r %r", gatt_cl_read_mult_rsp_ev_.__name__, att_status, value)
 
-    if (len(get_verify_values()) > 0 and not
-    (isinstance(get_verify_values()[0][0], str) and
-     isinstance(get_verify_values()[0][1], bytes))):
+    if len(get_verify_values()) > 0 and not (
+        isinstance(get_verify_values()[0][0], str) and isinstance(get_verify_values()[0][1], bytes)
+    ):
         clear_verify_values()
 
-    add_to_verify_values((att_rsp_str[status],
-                          (binascii.hexlify(value)).upper()))
+    status_str = att_rsp_str.get(att_status, f"ATT error 0x{att_status:02x}")
+    add_to_verify_values((status_str, (binascii.hexlify(value)).upper()))
 
     logging.debug("Set verify values to: %r", get_verify_values())
 
@@ -1003,6 +1053,54 @@ def gatt_cl_read_multiple_var(bd_addr_type, bd_addr, *hdls):
     stack.gatt_cl.set_event_to_await(stack.gatt_cl.is_read_complete)
 
     gatt_cl_command_rsp_succ()
+
+
+def gatt_cl_eatt_connect(bd_addr, bd_addr_type, num=1):
+    logging.debug("%s %r %r %r", gatt_cl_eatt_connect.__name__, bd_addr, bd_addr_type, num)
+    iutctl = get_iut()
+
+    gap_wait_for_connection()
+
+    bd_addr_ba = addr_str_to_le_bytes(bd_addr)
+    data_ba = bytearray(chr(bd_addr_type).encode("utf-8"))
+    data_ba.extend(bd_addr_ba)
+    data_ba.extend(struct.pack("B", num))
+
+    iutctl.btp_socket.send(*GATTC["eatt_connect"], data=data_ba)
+
+    tuple_hdr, tuple_data = iutctl.btp_socket.read()
+    if tuple_hdr.svc_id == defs.BTP_SERVICE_ID_GATTC:
+        if tuple_hdr.op == defs.BTP_STATUS:
+            raw_status = tuple_data[0] if len(tuple_data) > 0 else b""
+            if isinstance(raw_status, (bytes, bytearray)):
+                status = raw_status[0] if raw_status else defs.BTP_STATUS_FAILED
+            else:
+                status = raw_status
+            if status in (defs.BTP_STATUS_UNKNOWN_CMD, defs.BTP_STATUS_FAILED):
+                logging.debug(
+                    "%s GATTC EATT_CONNECT status 0x%02x, retrying via legacy GATT service",
+                    gatt_cl_eatt_connect.__name__,
+                    status,
+                )
+                logging.debug("%s sending legacy GATT EATT_CONNECT", gatt_cl_eatt_connect.__name__)
+                iutctl.btp_socket.send(
+                    defs.BTP_SERVICE_ID_GATT, defs.BTP_GATT_CMD_EATT_CONNECT, CONTROLLER_INDEX, data=data_ba
+                )
+                tuple_hdr, _ = iutctl.btp_socket.read()
+                logging.debug("%s legacy GATT EATT_CONNECT response: %r", gatt_cl_eatt_connect.__name__, tuple_hdr)
+                btp_hdr_check(tuple_hdr, defs.BTP_SERVICE_ID_GATT)
+                return
+
+            raise BTPError("Error opcode in response!")
+
+        btp_hdr_check(
+            tuple_hdr,
+            defs.BTP_SERVICE_ID_GATTC,
+            defs.BTP_GATTC_CMD_EATT_CONNECT,
+        )
+        return
+
+    btp_hdr_check(tuple_hdr, defs.BTP_SERVICE_ID_GATTC)
 
 
 def gatt_cl_write_without_rsp(bd_addr_type, bd_addr, hdl, val, val_mtp=None):
