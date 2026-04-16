@@ -23,8 +23,15 @@ log = logging.debug
 
 def gatt_wid_hdl(wid, description, test_case_name):
     use_gattc = get_stack().is_svc_supported("GATT_CL")
-    if test_case_name.startswith("GATT/CL/GAR/") and use_gattc:
-        return generic_wid_hdl(wid, description, test_case_name, [__name__, "autopts.wid.gatt_client", "autopts.wid.gatt"])
+    if test_case_name.startswith("GATT/CL/GAR/"):
+        if use_gattc:
+            return generic_wid_hdl(wid, description, test_case_name, [__name__, "autopts.wid.gatt_client", "autopts.wid.gatt"])
+        log(
+            "%s fallback to legacy GATT handlers for %s because GATT_CL is unsupported",
+            gatt_wid_hdl.__name__,
+            test_case_name,
+        )
+        return generic_wid_hdl(wid, description, test_case_name, [__name__, "autopts.wid.gatt"])
 
     log(f"{gatt_wid_hdl.__name__}, {wid}, {description}, {test_case_name}")
     return generic_wid_hdl(wid, description, test_case_name, [__name__, "autopts.wid.gatt"])

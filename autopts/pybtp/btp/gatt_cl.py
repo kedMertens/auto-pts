@@ -42,8 +42,21 @@ def gatt_cl_mtu_exchanged_ev_(gatt_cl, data, data_len):
     read_mult_var_fmt = '<B6sBBH'
 
     if data_len >= struct.calcsize(read_mult_var_fmt):
-        gatt_cl_read_mult_var_rsp_ev_(gatt_cl, data, data_len)
-        return
+        # Some Zephyr builds emit READ_MULTIPLE_VAR_RP payload with MTU_EXCHANGED event opcode.
+        # Reroute only when the payload shape is valid for READ_MULTIPLE_VAR to avoid false positives.
+        _, _, btp_status, _att_status, payload_len = struct.unpack_from(
+            read_mult_var_fmt,
+            data[:struct.calcsize(read_mult_var_fmt)],
+        )
+        known_btp_statuses = {
+            defs.BTP_STATUS_SUCCESS,
+            defs.BTP_STATUS_FAILED,
+            defs.BTP_STATUS_UNKNOWN_CMD,
+            defs.BTP_STATUS_NOT_READY,
+        }
+        if btp_status in known_btp_statuses and data_len - struct.calcsize(read_mult_var_fmt) >= payload_len:
+            gatt_cl_read_mult_var_rsp_ev_(gatt_cl, data, data_len)
+            return
 
     addr_type, addr, status = struct.unpack_from(fmt, data)
     addr = le_bytes_to_hex_str(addr)
@@ -541,7 +554,7 @@ def gatt_cl_read_mult_var_rsp_ev_(gatt_cl, data, data_len):
 
     # Legacy format: <addr_type, addr, att_status, data_length>
     legacy_fmt = '<B6sBH'
-    # Migrated Zephyr format: <addr_type, addr, btp_status, att_status, data_length>
+    # Extended format with explicit BTP status: <addr_type, addr, btp_status, att_status, data_length>
     migrated_fmt = '<B6sBBH'
 
     legacy_size = struct.calcsize(legacy_fmt)
@@ -602,7 +615,7 @@ def gatt_cl_read_mult_var_rsp_ev_(gatt_cl, data, data_len):
 
     (value,) = struct.unpack_from(f"{data_length}s", rp_data)
 
-    logging.debug("%s %r %r", gatt_cl_read_mult_rsp_ev_.__name__, att_status, value)
+    logging.debug("%s %r %r", gatt_cl_read_mult_var_rsp_ev_.__name__, att_status, value)
 
     if len(get_verify_values()) > 0 and not (
         isinstance(get_verify_values()[0][0], str) and isinstance(get_verify_values()[0][1], bytes)
@@ -1056,6 +1069,7 @@ def gatt_cl_read_multiple_var(bd_addr_type, bd_addr, *hdls):
 
 
 def gatt_cl_eatt_connect(bd_addr, bd_addr_type, num=1):
+    """Connect EATT channels using GATTC API, with fallback to legacy GATT API."""
     logging.debug("%s %r %r %r", gatt_cl_eatt_connect.__name__, bd_addr, bd_addr_type, num)
     iutctl = get_iut()
 

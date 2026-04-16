@@ -373,9 +373,13 @@ def test_cases_client(pts):
     stack = get_stack()
 
     def init_gatt_client_if_supported():
+        # Some IUT builds still expose only legacy GATT BTP service.
+        # Keep runtime registration conditional so the same suite can run on both APIs.
         if stack.is_svc_supported("GATT_CL"):
             btp.core_reg_svc_gatt_cl()
             stack.gatt_cl_init()
+        else:
+            logging.debug("GATT_CL service is not reported by IUT, using legacy GATT WID flow")
 
     pre_conditions = [
         TestFunc(stack.gap_init, iut_device_name),
